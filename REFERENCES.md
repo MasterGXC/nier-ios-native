@@ -23,3 +23,14 @@ it caused allocation churn and is not recommended.
 No unrelated game port, proprietary game binary, game-derived shader library or
 private build history is merged here. A source integration is not a merger of
 all referenced projects' ownership or a claim to their authorship.
+
+The next candidate's launcher and settings model are from nxnative revision
+`cdc6cef6b0250fcb54a061e4c55d56382b5d18ad`; local changes carry the earlier
+Chinese strings into that UI without replacing its persistence/override rules.
+
+[ThrecL's NieR follow-up PR #336](https://github.com/seedds/nxnative/pull/336)
+was reviewed at `89ee0df21497070bfd3d826cc9d0184a82065b33`. It reports Mac
+60 fps and variable iPhone performance (one heavy scene 39.13 fps). These are
+author-reported observations, not this project's iPad acceptance. Its graphics
+ABI changes require matching shader rebuilds; its dynamic-resolution sites are
+gated to a different main build. No fixed addresses are transferred blindly.

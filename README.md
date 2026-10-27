@@ -33,6 +33,22 @@ the patch. It does not download games, sign, install, or launch anything.
 python3 prepare.py /path/to/new/nier-host
 ```
 
+The separately selectable `next-candidate.patch` adds the upstream single-screen
+launcher/settings model with Chinese localization and an opt-in completion-owned
+geometry scratch ring. It passed an iOS SDK build (candidate 1.0.27), 166,698
+actual-C slot-selection cases and a 100,000-step ownership model. It has **not**
+passed real-device gameplay/performance validation. Select it with:
+
+```sh
+python3 prepare.py /path/to/new/nier-candidate --patch next-candidate.patch
+```
+
+`DM_NVN_GEO_POOL_MB=64` and `DM_NVN_GEO_RING=1` enable that experiment. Leave the
+ring unset for a comparison with the previous single-pool implementation. The
+three slots share a budget; oversized draws retain the existing 256 MiB bound.
+They submit without an unconditional wait and wait for a slot's own completion
+before reuse or retirement. This is a diagnostic comparison, not a 60 fps claim.
+
 Then follow the prepared checkout's `README.md` and `docs/development.md` to build
 using your own files. Windows can prepare source; an Apple SDK/toolchain is still
 required for the final iOS build. Do not upload game inputs to public Actions.
@@ -52,6 +68,11 @@ These are review targets, **not claimed fixes for the purple model**. Shader-cha
 changes require rebuilding matching libraries; never mix libraries across chains.
 
 See [REFERENCES.md](REFERENCES.md) for provenance and comparison.
+
+Also under review: [NieR-specific upstream PR #336](https://github.com/seedds/nxnative/pull/336),
+head `89ee0df21497070bfd3d826cc9d0184a82065b33`, by ThrecL. It contains additional
+geometry/texture/iOS performance work; its different build-specific addresses and
+changed shader chain must be verified before adoption. It is not merged here.
 
 ## Contributing
 

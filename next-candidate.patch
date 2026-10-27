@@ -1,0 +1,956 @@
+--- a/dm/gfx/nvn/nvn_geometry.inc
++++ b/dm/gfx/nvn/nvn_geometry.inc
+@@ -4,6 +4,145 @@
+ static uint64_t g_geo_indices, g_geo_index_bytes, g_geo_args;
+ static void draw(const p_draw *dw, const p_draw_idx *di);
+ static void lc_land(void);
++
++// Opt-in bounded scratch for this replay stage, separate from uniform arenas.
++// The upload allocator's existing backpressure design is the model: reuse only
++// after the ordered GPU event confirms all prior users completed. Never reset
++// general arenas here: their cached uniform shadows may still be referenced.
++static int geo_pool_needs_drain(size_t used, size_t capacity, size_t n) {
++    return used > capacity || n > capacity - used;
++}
++static size_t geo_pool_size(void) {
++    static size_t bytes; static int read;
++    if (!read) {
++        read = 1; const char *e = getenv("DM_NVN_GEO_POOL_MB"); char *end;
++        if (e && *e) { unsigned long mb = strtoul(e, &end, 10);
++            if (!*end && mb >= 4 && mb <= 256) bytes = (size_t)mb << 20; }
++    }
++    return bytes;
++}
++// Experimental alternate to the single-buffer pool. A slot is reusable only
++// after its own ordered GPU signal completes. The total budget is shared by all
++// slots; an oversized draw raises it only to that draw's existing validated bound.
++static unsigned geo_ring_next(const size_t capacity[3], const uint64_t fence[3],
++                              unsigned current, size_t n, size_t budget) {
++    unsigned count = 0, best = current;
++    for (unsigned i = 0; i < 3; i++) if (capacity[i] >= n) {
++        if (!count || fence[i] < fence[best]) best = i;
++        count++;
++    }
++    // Keep two fitting slots when the budget allows it. Once they exist,
++    // rotate them instead of allocating a third slot and evicting one per wrap.
++    if (count >= 2 || (count && n > budget / 2)) return best;
++    for (unsigned step = 1; step <= 3; step++) {
++        unsigned i = (current + step) % 3;
++        if (capacity[i] < n) return i;
++    }
++    return (current + 1) % 3;
++}
++static size_t geo_ring_alloc(size_t n, size_t budget, __strong id<MTLBuffer> *out) {
++    static id<MTLBuffer> buffers[3];
++    static size_t capacity[3], used[3];
++    static uint64_t fence[3], sequence, seals, waits;
++    static id<MTLSharedEvent> completion;
++    static unsigned current = 2;
++    if (!completion) completion = [g_dev newSharedEvent];
++    if (!completion) MDIE("cannot create geometry scratch completion event");
++    if (n > (256u << 20)) MDIE("geometry scratch exceeds validated draw bound");
++    n = (n + 255) & ~(size_t)255;
++    if (buffers[current] && !geo_pool_needs_drain(used[current], capacity[current], n)) {
++        size_t off = used[current]; used[current] += n; *out = buffers[current]; return off;
++    }
++    if (buffers[current] && used[current]) {
++        // Submit, but do not wait here. The next slot can be written while the
++        // GPU still consumes this one. This mirrors mdi_wait's encoder/commit
++        // ordering, without its unconditional CPU wait after every pool wrap.
++        rp_end(); ubd_land();
++        if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
++        up_flush(); res_commit();
++        [g_cb endCommandBuffer]; rec_commit(g_cb, nil);
++        fence[current] = ++sequence;
++        rec_signal(completion, sequence); rec_drain();
++        g_cb = rec_cb_new();
++        [g_cb beginCommandBufferWithAllocator:g_alloc4[g_alloc_cur]];
++        seals++;
++    }
++    current = geo_ring_next(capacity, fence, current, n, budget);
++    if (fence[current] > completion.signaledValue) {
++        waits++;
++        if (![completion waitUntilSignaledValue:fence[current] timeoutMS:10000] ||
++            completion.signaledValue < fence[current])
++            MDIE("geometry ring reuse refused: GPU completion timeout");
++    }
++    used[current] = 0;
++    if (capacity[current] < n) {
++        size_t wanted = MAX((budget / 3) & ~(size_t)255, n);
++        size_t ceiling = MAX(budget, n);
++        size_t total = capacity[0] + capacity[1] + capacity[2] - capacity[current];
++        // Retire completed slots only when growth would exceed the shared
++        // budget. This is not a per-draw eviction of the general uniform cache.
++        for (unsigned i = 0; i < 3 && total + wanted > ceiling; i++) {
++            if (i == current || !buffers[i]) continue;
++            if (fence[i] > completion.signaledValue) {
++                waits++;
++                if (![completion waitUntilSignaledValue:fence[i] timeoutMS:10000] ||
++                    completion.signaledValue < fence[i])
++                    MDIE("geometry ring retirement refused: GPU completion timeout");
++            }
++            res_remove(buffers[i]); total -= capacity[i];
++            buffers[i] = nil; capacity[i] = used[i] = 0; fence[i] = 0;
++        }
++        if (total + wanted > ceiling) MDIE("geometry ring budget accounting");
++        if (buffers[current]) { res_remove(buffers[current]); buffers[current] = nil; }
++        capacity[current] = 0; res_commit();
++        id<MTLBuffer> next = [g_dev newBufferWithLength:wanted options:MTLResourceStorageModeShared];
++        if (!next && wanted != n) { wanted = n;
++            next = [g_dev newBufferWithLength:wanted options:MTLResourceStorageModeShared]; }
++        if (!next) MDIE("cannot allocate %zu bytes of geometry ring scratch", wanted);
++        buffers[current] = next; capacity[current] = wanted; res_add(next);
++    }
++    if (seals && (seals <= 4 || seals % 300 == 0))
++        MLOG("geometry scratch ring: seals %llu, waits %llu, backing %zu bytes",
++             (unsigned long long)seals, (unsigned long long)waits,
++             capacity[0] + capacity[1] + capacity[2]);
++    used[current] = n; *out = buffers[current]; return 0;
++}
++
++static size_t geo_scratch_alloc(size_t n, __strong id<MTLBuffer> *out) {
++    size_t target = geo_pool_size();
++    if (!target) return arena_alloc(n, out);
++    const char *ring = getenv("DM_NVN_GEO_RING");
++    if (ring && !strcmp(ring, "1")) return geo_ring_alloc(n, target, out);
++    static id<MTLBuffer> pool; static size_t used, capacity;
++    static uint64_t drains, grows;
++    if (n > (256u << 20)) MDIE("geometry scratch request exceeds validated bound");
++    n = (n + 255) & ~(size_t)255;
++    if (!pool || geo_pool_needs_drain(used, capacity, n)) {
++        if (pool) {
++            mdi_wait();
++            if (g_mdi_ev.signaledValue < g_mdi_v)
++                MDIE("geometry scratch reuse refused: prior GPU users did not complete");
++            used = 0; drains++;
++        }
++        if (!pool || capacity < n) {
++            // A larger draw is still rendered in full. Keep only one backing
++            // buffer, retiring the old one after the drain above.
++            if (pool) { res_remove(pool); res_commit(); pool = nil; capacity = 0; }
++            size_t wanted = MAX(target, n);
++            pool = [g_dev newBufferWithLength:wanted options:MTLResourceStorageModeShared];
++            if (!pool && wanted != n) {
++                wanted = n; pool = [g_dev newBufferWithLength:wanted options:MTLResourceStorageModeShared];
++            }
++            if (!pool) MDIE("cannot allocate %zu bytes of bounded geometry scratch", wanted);
++            capacity = wanted; used = 0; res_add(pool); grows++;
++            MLOG("geometry scratch pool: capacity %zu bytes, grows %llu, completion drains %llu", capacity,
++                 (unsigned long long)grows, (unsigned long long)drains);
++        }
++        if (drains && (drains <= 4 || drains % 300 == 0))
++            MLOG("geometry scratch pool: completion drains %llu, capacity %zu bytes", (unsigned long long)drains, capacity);
++    }
++    size_t offset = used; used += n; *out = pool; return offset;
++}
+ 
+ static int geo_cmp_index(const void *a, const void *b) {
+     uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+@@ -223,7 +362,7 @@
+         free(order);
+         if (!geo_split(pr, dw0 ? &dw : NULL, dw0 ? NULL : &di, count, instances, first_instance)) MLOG("[RED] geometry draw needs %llu MiB of scratch, above the 256 MiB bound", (unsigned long long)(total >> 20)); return;
+     }
+-    id<MTLBuffer> scratch; size_t off = arena_alloc((size_t)total, &scratch);
++    id<MTLBuffer> scratch; size_t off = geo_scratch_alloc((size_t)total, &scratch);
+     uint8_t *cpu = (uint8_t *)scratch.contents + off; uint64_t gpu = scratch.gpuAddress + off;
+     size_t used = 0;
+     #define GEO_ALLOC(N, G, P) do { used = (used + 255) & ~(size_t)255; (G) = gpu + used; (P) = cpu + used; used += (size_t)(N); } while (0)
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -90,6 +90,9 @@
+ static id<MTL4ArgumentTable> g_present_args;
+ static id<MTLBuffer> g_present_uv[3];
+ static uint64_t g_present_alloc_fence[3];
++// Upstream82ab25b (MIT): display-ticket progress is not GPU completion.
++// Protect each allocator with the ticket reported by its own feedback handler.
++static uint64_t g_present_alloc_done[3];
+ static pthread_mutex_t g_pq_mu = PTHREAD_MUTEX_INITIALIZER;
+ static pthread_cond_t g_pq_cv = PTHREAD_COND_INITIALIZER;
+ static pthread_cond_t g_link_cv = PTHREAD_COND_INITIALIZER;
+@@ -1616,6 +1619,9 @@
+ static _Atomic uint64_t g_upload_ns;   // Cumulative time of deswizzle + upload encoding on the submit thread (timing instrumentation)
+ static _Atomic uint64_t g_upload_gpu_ns;
+ static id<MTL4CommandBuffer> g_up_cb;
++// Match the existing upload allocator slots. A slot is reused only after its
++// feedback handler has retired staging and cleared g_up_alloc_busy[slot].
++static id<MTL4CommandBuffer> g_up_cb_slot[3];
+ static id<MTL4ComputeCommandEncoder> g_up_ce;
+ static _Atomic int g_up_alloc_busy[3];
+ // Waiting for upload batches to finish (g_up_pending, g_up_alloc_busy): the batches' completion handler broadcasts after it updates them, so waiters sleep until then (they used to poll every 0.2–1 ms;
+@@ -1731,7 +1737,8 @@
+     up_wait_zero(&g_up_alloc_busy[slot], WS_UPALLOC);
+     atomic_store(&g_up_alloc_busy[slot], 1); g_up_cur_slot = slot;
+     [g_up_alloc4[slot] reset];
+-    g_up_cb = [g_dev newCommandBuffer];
++    if (!g_up_cb_slot[slot]) g_up_cb_slot[slot] = [g_dev newCommandBuffer];
++    g_up_cb = g_up_cb_slot[slot];
+     [g_up_cb beginCommandBufferWithAllocator:g_up_alloc4[slot]];
+     g_up_ce = [g_up_cb computeCommandEncoder];
+     [g_up_ce barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
+@@ -3779,13 +3786,36 @@
+ @interface NvArena : NSObject { @public id<MTLBuffer> buf; uint64_t gpu, fence; size_t used, len; } @end   // len: buf.length, kept so an allocation sends no message
+ @implementation NvArena @end
+ static NSMutableArray<NvArena *> *g_arenas; static NvArena *g_cur_arena; static NSMutableArray<NvArena *> *g_sub_arenas;
++// Idle caches are optional; command submission fences are not. Do not wait
++// or retire the current submission from this allocation path.
++static int arena_cache_evictable(uint64_t fence, uint64_t done) {
++    return fence != 0 && fence <= done;
++}
++static size_t arena_trim_completed(size_t budget) { @autoreleasepool {
++    uint64_t done = g_done; size_t cached = 0, released = 0;
++    for (NvArena *a in g_arenas)
++        if (arena_cache_evictable(a->fence, done)) cached += a->len;
++    for (NSUInteger i = g_arenas.count; i-- > 0 && cached > budget;) {
++        NvArena *a = g_arenas[i];
++        if (!arena_cache_evictable(a->fence, done)) continue;
++        cached -= a->len; released += a->len;
++        res_remove(a->buf); [g_arenas removeObjectAtIndex:i];
++    }
++    if (released) res_commit();
++    return released;
++} }
+ static NvArena *arena_new(size_t minimum) {
+     // The for-in loop variable does not retain the object: take a strong reference first and then remove it from the array, otherwise what is returned after the array releases it is a dangling pointer
+     NvArena *r = nil;   // the smallest one that fits, so the usual small requests do not keep a large scratch arena alive (ARENA_IDLE, arena_begin)
+     for (NvArena *it in g_arenas) if (it->fence && it->fence <= g_done && it->len >= minimum && (!r || it->len < r->len)) r = it;
+     if (r) { [g_arenas removeObject:r]; r->fence = 0; r->used = 0; return r; }
+     NvArena *a = [NvArena new]; a->buf = [g_dev newBufferWithLength:MAX(minimum, 4u << 20) options:MTLResourceStorageModeShared];
+-    if (!a->buf) MDIE("cannot allocate %zu bytes of frame scratch", minimum);
++    if (!a->buf) {
++        size_t released = arena_trim_completed(0);
++        MLOG("scratch allocation pressure: requested %zu bytes; evicted %zu bytes of completed idle cache", minimum, released);
++        if (released) a->buf = [g_dev newBufferWithLength:MAX(minimum, 4u << 20) options:MTLResourceStorageModeShared];
++    }
++    if (!a->buf) MDIE("cannot allocate %zu bytes of frame scratch after completed-cache reclamation", minimum);
+     a->gpu = a->buf.gpuAddress; a->len = a->buf.length; res_add(a->buf); g_arena_made++; return a;
+ }
+ // Arenas above ARENA_KEEP bytes are scratch for large one-off work (a geometry draw's capture, up to 256 MB each). They are kept for reuse while that work goes on and released once
+@@ -8758,7 +8788,7 @@
+     int alloc_i = (int)(ticket % 3);
+     if (g_present_alloc_fence[alloc_i]) {
+         pthread_mutex_lock(&g_pq_mu);
+-        while (g_pq_done < g_present_alloc_fence[alloc_i]) pthread_cond_wait(&g_pq_cv, &g_pq_mu);
++        while (g_present_alloc_done[alloc_i] < g_present_alloc_fence[alloc_i]) pthread_cond_wait(&g_pq_cv, &g_pq_mu);
+         pthread_mutex_unlock(&g_pq_mu);
+     }
+     [g_present_alloc4[alloc_i] reset];
+@@ -8770,7 +8800,7 @@
+     MTL4CommitOptions *o = [MTL4CommitOptions new];
+     [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) {
+         if (f.error) MLOG("[RED] display command buffer error: %s", f.error.description.UTF8String);
+-        pthread_mutex_lock(&g_pq_mu); if (ticket > g_pq_done) g_pq_done = ticket; g_pq_inflight--; pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu);
++        pthread_mutex_lock(&g_pq_mu); if (ticket > g_pq_done) g_pq_done = ticket; if (ticket > g_present_alloc_done[alloc_i]) g_present_alloc_done[alloc_i] = ticket; g_pq_inflight--; pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu);
+     }];
+     id<MTL4CommandBuffer> buffers[] = {cb};
+     pthread_mutex_lock(&g_pq_mu); g_pq_inflight++; pthread_mutex_unlock(&g_pq_mu);
+--- a/dm/gfx/nvn/nvn_rec.h
++++ b/dm/gfx/nvn/nvn_rec.h
+@@ -109,7 +109,11 @@
+ static void rec_exec(const rec_t *r) {
+     const uint64_t *a = r->a; id e = g_rx_enc;
+     switch (r->op) {
+-    case RO_CB_NEW: g_rx_cb = [g_dev newCommandBuffer]; break;
++    case RO_CB_NEW:
++        // Metal 4 containers are reusable after commit. The allocator still
++        // waits on its own GPU fence before reset; never reset it here.
++        if (!g_rx_cb) g_rx_cb = [g_dev newCommandBuffer];
++        break;
+     case RO_CB_BEGIN: [(id<MTL4CommandBuffer>)g_rx_cb beginCommandBufferWithAllocator:rec_id(a[0])]; break;
+     case RO_CB_END: [(id<MTL4CommandBuffer>)g_rx_cb endCommandBuffer]; break;
+     case RO_COMMIT: case RO_COMMIT_REAL: {
+@@ -118,7 +122,7 @@
+         pthread_mutex_lock(&g_res_mu);
+         if (o) [g_q4 commit:buffers count:1 options:o]; else [g_q4 commit:buffers count:1];
+         pthread_mutex_unlock(&g_res_mu);
+-        if (r->op == RO_COMMIT) g_rx_cb = nil;
++        // Keep the command-buffer container; its next begin uses a fenced allocator.
+         break; }
+     case RO_SIGNAL: [g_q4 signalEvent:rec_id(a[0]) value:a[1]]; break;
+     case RO_RE_BEGIN: g_rx_enc = [(id<MTL4CommandBuffer>)g_rx_cb renderCommandEncoderWithDescriptor:rec_id(a[0])]; break;
+@@ -313,7 +317,14 @@
+ @end
+ 
+ // The replay's entry points
+-static id rec_cb_new(void) { if (!rec_on()) return [g_dev newCommandBuffer]; rec_put(RO_CB_NEW, 0); return [DmRecCB new]; }
++static id rec_cb_new(void) {
++    if (!rec_on()) {
++        static id<MTL4CommandBuffer> cb;
++        if (!cb) cb = [g_dev newCommandBuffer];
++        return cb;
++    }
++    rec_put(RO_CB_NEW, 0); return [DmRecCB new];
++}
+ static id rec_table(id t) { if (!rec_on() || !t) return t; DmRecTable *s = [DmRecTable new]; s->real = t; return s; }
+ // The replay's main command buffer: committed once the uniform shadows queued so far are made (ubc_wait)
+ static void rec_commit(id cb, MTL4CommitOptions *o) {
+--- a/dm/gfx/tests/t_geometry.m
++++ b/dm/gfx/tests/t_geometry.m
+@@ -473,7 +473,7 @@
+     mtl_pool_del(uniforms);mtl_drain();free(uniforms);
+ }
+ int main(int argc,char **argv) {@autoreleasepool {
+-    setvbuf(stdout,NULL,_IONBF,0);assembly();capture_indices();mtl_init();storage_buffers();cpu_read_proofs();pack_test();
++    setvbuf(stdout,NULL,_IONBF,0);assembly();capture_indices();if(failed)return 1; id<MTLDevice> available=MTLCreateSystemDefaultDevice(); if(!available || ![available supportsFamily:MTLGPUFamilyMetal4]) {printf("BLOCKED_GPU_REPLAY: Metal4 unavailable; CPU assembly only, GPU assertions NOT RUN\n");return 77;} mtl_init();storage_buffers();cpu_read_proofs();pack_test();
+     scan_edges();pack_dependency_test(3);pack_dependency_test(257);pack_dependency_test(129032);for(int mode=0;mode<18;mode++)replay(mode);
+     if(argc>2&&!strcmp(argv[1],"--passthrough-layouts")) {
+         NSData *data=[NSData dataWithContentsOfFile:@(argv[2])];NSArray *layouts=data?[NSJSONSerialization JSONObjectWithData:data options:0 error:nil]:nil;
+--- a/dm/host/crash.c
++++ b/dm/host/crash.c
+@@ -194,6 +194,11 @@
+     stack_t ss = {.ss_sp = malloc(65536), .ss_size = 65536}; sigaltstack(&ss, 0);
+     pthread_setspecific(g_altstack_key, ss.ss_sp);
+ }
++static unsigned watch_seconds(const char *value) {
++    if (!value || !*value) return 0;
++    char *end; long seconds = strtol(value, &end, 10);
++    return *end == 0 && seconds > 0 && seconds <= 86400 ? (unsigned)seconds : 0;
++}
+ void crash_install(void) {
+     crash_thread_init();
+     struct sigaction sa = {.sa_sigaction = on_crash, .sa_flags = SA_SIGINFO | SA_ONSTACK};
+@@ -201,9 +206,10 @@
+     // Both watchdogs are turned on only when a test explicitly sets DM_WATCH / DM_WATCH_STALL: the product (the player launches from the desktop, no environment variables) turns on neither.
+     // Found by reading the code: iOS main.m did setenv DM_WATCH=30 by default → the player's launch was killed by SIGALRM at 30 s; the no-progress watchdog defaulted to 15 s → the pause menu (ticks stopped) was killed at 15 s
+     const char *watch = getenv("DM_WATCH"), *stall = getenv("DM_WATCH_STALL");
+-    if (watch) alarm(atoi(watch));
+-    if (watch || stall) {
+-        g_watch_stall = stall && atoi(stall) > 0 ? (unsigned)atoi(stall) : 15;
++    unsigned limit = watch_seconds(watch), stall_limit = watch_seconds(stall);
++    if (limit) alarm(limit);
++    if (limit || stall_limit) {
++        g_watch_stall = stall_limit ? stall_limit : 15;
+         atomic_store(&g_watch_last_ns, watch_now_ns());
+         pthread_t th; if (pthread_create(&th, NULL, watchdog_main, NULL)) die("watchdog thread");
+         pthread_detach(th);
+--- a/dm/ios/Sources/DmGamepad.m
++++ b/dm/ios/Sources/DmGamepad.m
+@@ -1,6 +1,5 @@
+ // Virtual gamepad (Nintendo button positions) + physical controllers (GameController). Both are merged and handed to the host through dm_input_set (hle_hid.c, bit layout in dm_input.h).
+-//   Two layouts, three in handheld mode; one tap on the layout button at the top centre (labelled with the current layout, "2D" / "3D" / "Tap") goes to the next, and the choice is kept in NSUserDefaults (each game is its own app, so per game); the first launch uses the game profile's pad_layout (DM_GAME_PAD_LAYOUT).
+-//   Tap (touch): no control but the layout button, every other touch goes to the game's touch screen; offered only while the game is in handheld mode, the only one in which it reads the touch screen (Balatro, played by touch).
++//   Two layouts; one tap on the layout button at the top centre (labelled with the current layout, "2D" / "3D") switches them, and the choice is kept in NSUserDefaults (each game is its own app, so per game); the first launch uses the game profile's pad_layout (DM_GAME_PAD_LAYOUT).
+ //   2D (simple): top corners ZL above L (one column), ZR above R likewise, teardrops with the tip toward the screen corner; − and + side by side at the top centre; the left stick in the bottom-left corner (fixed ring, tilt measured from the ring centre, small dead zone);
+ //     the A (right) B (bottom) X (top) Y (left) diamond in the bottom-right corner, sliding a finger between keys switches keys. Each bottom corner holds a single control, so it sits close in (reaching halfway into the side safe-area inset).
+ //   3D (full, Pro Controller style): everything in 2D (left stick and diamond keep their place and size), plus a D-pad (inward of and below the left stick, 8-way), a right stick that is not drawn
+@@ -21,13 +20,13 @@
+ #include "dm_input.h"
+ #include "front.h"
+ #include "game_profile.h"
+-#include "haptics_apple.h"
+ 
+ enum { B_A = 0, B_B, B_X, B_Y, B_LS, B_RS, B_L, B_R, B_ZL, B_ZR, B_PLUS, B_MINUS, B_LEFT, B_UP, B_RIGHT, B_DOWN, B_N };
+ enum { C_NONE = 0, C_STICK, C_DPAD, C_FACE, C_BTN, C_SWAP, C_GAME };   // which control a touch holds; C_GAME: none, the touch goes to the game's touch screen (finger slot << 8)
+ 
+ static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
+-static uint64_t g_touch_btn, g_pad_btn, g_shake_btn;
++static uint64_t g_touch_btn, g_pad_btn, g_shake_btn, g_test_btn;
++static NSDictionary *g_face_maps;
+ static int32_t g_touch_lx, g_touch_ly, g_touch_rx, g_touch_ry, g_pad_lx, g_pad_ly, g_pad_rx, g_pad_ry;
+ static int tilted(int32_t x, int32_t y) { return (int64_t)x * x + (int64_t)y * y > (int64_t)4000 * 4000; }
+ static void publish(void) {
+@@ -35,7 +34,7 @@
+     int32_t lx = g_touch_lx, ly = g_touch_ly, rx = g_touch_rx, ry = g_touch_ry;
+     if (tilted(g_pad_lx, g_pad_ly)) { lx = g_pad_lx; ly = g_pad_ly; }   // a tilted physical stick wins
+     if (tilted(g_pad_rx, g_pad_ry)) { rx = g_pad_rx; ry = g_pad_ry; }
+-    dm_input_set(g_touch_btn | g_pad_btn | g_shake_btn, lx, ly, rx, ry);
++    dm_input_set(g_touch_btn | g_pad_btn | g_shake_btn | g_test_btn, lx, ly, rx, ry);
+     pthread_mutex_unlock(&g_mu);
+ }
+ 
+@@ -90,8 +89,7 @@
+     K_RSWIPE = 1.0 / 3,                             // right stick area: this fraction of the screen width from the right edge (not in u)
+     K_CLICK_X = 102, K_CLICK_R = 17;                // L3 / R3: centre from the outer edge (level with ZL / ZR), radius
+ static const int k_btns[] = {B_ZL, B_L, B_ZR, B_R, B_MINUS, B_PLUS, B_LS, B_RS};   // keys locked at touch-down (L3 / R3 only in the 3D layout)
+-static NSString *const k_layout_key = @"DmPadLayout";   // NSUserDefaults: 0 = 2D, 1 = 3D, 2 = Tap (DM_GAME_PAD_LAYOUT's numbers)
+-int dm_opmode(void);   // hle_oe.c: 0 = handheld
++static NSString *const k_layout_key = @"DmPadLayout";   // NSUserDefaults: 1 = 3D, 0 = 2D
+ 
+ @interface DmGamepad : UIView
+ @end
+@@ -106,13 +104,13 @@
+     CAShapeLayer *_key[B_N]; CATextLayer *_label[B_N];   // one layer per key
+     CAShapeLayer *_ring, *_knob;                   // the left stick (the right one is not drawn)
+     CAShapeLayer *_swap; CATextLayer *_swapLabel; BOOL _swapHeld;
+-    UIImpactFeedbackGenerator *_touchFeedback;       // one short feedback per touch-control press edge
+-    unsigned _hapticSticks;
+     BOOL _stickShown;                              // the left stick was held at the last refresh
+-    BOOL _full, _tap;                              // the 3D layout / the Tap layout is current
++    BOOL _full;                                    // the 3D layout is current
+     CALayer *_controls;                            // holds every control layer: hidden while a physical controller is connected (the view itself stays, for game touches)
+     BOOL _padOff;                                  // a physical controller is connected: every touch goes to the game
+     UITouch *_game[16];                            // touches on the game's touch screen by finger slot
++    NSString *_commandPath, *_lastCommand;
++    BOOL _commandPrimed;
+ }
+ 
+ static UIColor *k_idle, *k_on, *k_line, *k_ringFill, *k_text, *k_textOn;
+@@ -132,11 +130,6 @@
+ - (instancetype)initWithFrame:(CGRect)f {
+     if ((self = [super initWithFrame:f])) {
+         self.multipleTouchEnabled = YES; self.opaque = NO; self.backgroundColor = UIColor.clearColor;
+-        const char *feedback = getenv("DM_TOUCH_HAPTICS");
+-        if (!feedback || atoi(feedback)) {
+-            _touchFeedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+-            [_touchFeedback prepare];
+-        }
+         _owner = [NSMapTable strongToStrongObjectsMapTable]; _faceOf = [NSMapTable strongToStrongObjectsMapTable];
+         static dispatch_once_t once;
+         dispatch_once(&once, ^{
+@@ -156,30 +149,33 @@
+         }
+         _swap = shape(_controls); _swapLabel = label(_swap, @"");
+         NSNumber *saved = [NSUserDefaults.standardUserDefaults objectForKey:k_layout_key];
+-        int l = saved ? (int)saved.integerValue : DM_GAME_PAD_LAYOUT;
+-        if (l == 2 && dm_opmode() != 0) l = 0;   // Tap only in handheld mode (env.txt's DM_OPMODE may have changed it)
+-        _full = l == 1; _tap = l == 2;
++        _full = saved ? saved.boolValue : (DM_GAME_PAD_LAYOUT == 1);
+         [self applyLayout];
+         NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
+         [nc addObserver:self selector:@selector(padsChanged) name:GCControllerDidConnectNotification object:nil];
+         [nc addObserver:self selector:@selector(padsChanged) name:GCControllerDidDisconnectNotification object:nil];
++        [nc addObserver:self selector:@selector(padsChanged) name:UIApplicationDidBecomeActiveNotification object:nil];
+         [self padsChanged];
++        if (getenv("DM_PAD_COMMANDS") && atoi(getenv("DM_PAD_COMMANDS"))) {
++            _commandPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/input-command.json"];
++            [NSTimer scheduledTimerWithTimeInterval:0.1 target:self selector:@selector(pollCommand) userInfo:nil repeats:YES];
++            LOG("controller diagnostic: local Documents/input-command.json enabled");
++        }
+         motion_start();
+     }
+     return self;
+ }
+ - (void)applyLayout {   // show / hide the controls for the current layout
+     [CATransaction begin]; [CATransaction setDisableActions:YES];
+-    for (int b = 0; b < B_N; b++) _key[b].hidden = _tap || (fullOnly(b) && !_full);
+-    _ring.hidden = _knob.hidden = _tap;
+-    _swapLabel.string = _tap ? @"Tap" : _full ? @"3D" : @"2D";
++    for (int b = 0; b < B_N; b++) _key[b].hidden = fullOnly(b) && !_full;
++    _swapLabel.string = _full ? @"3D" : @"2D";
+     [CATransaction commit];
+ }
+-- (void)nextLayout {   // 2D → 3D (→ Tap in handheld mode) → 2D: release every touch first (no key stays held), save, lay out again
+-    int l = _tap ? 0 : _full ? (dm_opmode() == 0 ? 2 : 0) : 1;
++- (void)setFull:(BOOL)full {   // switch layouts: release every touch first (no key stays held), save, lay out again
++    if (full == _full) return;
+     [self reset];
+-    _full = l == 1; _tap = l == 2;
+-    [NSUserDefaults.standardUserDefaults setObject:@(l) forKey:k_layout_key];
++    _full = full;
++    [NSUserDefaults.standardUserDefaults setObject:@(full) forKey:k_layout_key];
+     [self applyLayout]; [self setNeedsLayout];
+ }
+ 
+@@ -260,12 +256,6 @@
+         ax[i * 2] = (int32_t)lrint(o.x * m * 32767); ax[i * 2 + 1] = (int32_t)lrint(-o.y * m * 32767);   // host: up is positive; rounded so full tilt is exactly 32767
+     }
+     BOOL changed = face != _faceBits || dpad != _dpadBits || btn != _btnBits || swap != _swapHeld;
+-    uint64_t pressed = (face | dpad | btn) & ~(_faceBits | _dpadBits | _btnBits);
+-    unsigned gripping = (_stick[0] ? 1u : 0) | (_stick[1] ? 2u : 0);
+-    if (pressed || (swap && !_swapHeld) || (gripping & ~_hapticSticks)) {
+-        [_touchFeedback impactOccurredWithIntensity:0.6]; [_touchFeedback prepare];
+-    }
+-    _hapticSticks = gripping;
+     _faceBits = face; _dpadBits = dpad; _btnBits = btn; _swapHeld = swap;
+     pthread_mutex_lock(&g_mu);
+     g_touch_btn = face | dpad | btn; g_touch_lx = ax[0]; g_touch_ly = ax[1]; g_touch_rx = ax[2]; g_touch_ry = ax[3];
+@@ -297,10 +287,9 @@
+     BOOL game = NO;
+     for (UITouch *t in ts) {
+         if (_padOff) { game |= [self gameBegin:t]; continue; }
+-        CGPoint p = [t locationInView:self]; int hit = _tap ? -1 : [self btnAt:p];
++        CGPoint p = [t locationInView:self]; int hit = [self btnAt:p];
+         if (hit >= 0) { [_owner setObject:@(C_BTN | (uint64_t)hit << 8) forKey:t]; continue; }
+         if ([self inSwap:p]) { [_owner setObject:@(C_SWAP) forKey:t]; continue; }
+-        if (_tap) { game |= [self gameBegin:t]; continue; }
+         // diamond, D-pad, left stick: take the one with the smallest distance / grab radius, if it is <= 1
+         CGFloat best = 1; int kind = C_NONE, idx = 0;
+         CGFloat f = dist(p, self.faceCenter) / (self.faceGap + self.faceR * 1.6); if (f <= best) { best = f; kind = C_FACE; }
+@@ -338,7 +327,7 @@
+     }
+     if (game) [self pushGame];
+     [self recompute];
+-    if (swap) [self nextLayout];
++    if (swap) [self setFull:!_full];
+ }
+ - (void)touchesEnded:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { [self endTouches:ts tapped:YES]; }
+ - (void)touchesCancelled:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { [self endTouches:ts tapped:NO]; }
+@@ -415,36 +404,99 @@
+ }
+ 
+ // ---- Physical controllers ----
++- (void)pollCommand {
++    if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive) return;
++    NSData *data=[NSData dataWithContentsOfFile:_commandPath options:NSDataReadingMappedIfSafe error:nil];
++    if (data.length>1024) return;
++    NSDictionary *command=data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
++    if (command && ![command isKindOfClass:NSDictionary.class]) return;
++    NSString *nonce=command[@"id"];
++    if (!_commandPrimed) { _commandPrimed=YES;_lastCommand=[nonce isKindOfClass:NSString.class] ? nonce : nil;return; }
++    if (![nonce isKindOfClass:NSString.class] || !nonce.length || nonce.length>64 || [nonce isEqual:_lastCommand]) return;
++    NSNumber *buttons=command[@"buttons"],*duration=command[@"ms"];
++    if (![buttons isKindOfClass:NSNumber.class] || ![duration isKindOfClass:NSNumber.class]) return;
++    uint64_t mask=buttons.unsignedLongLongValue;int ms=duration.intValue;
++    if (mask>0xffff || ms<10 || ms>500) return;
++    _lastCommand=[nonce copy];
++    pthread_mutex_lock(&g_mu);g_test_btn=mask;pthread_mutex_unlock(&g_mu);publish();
++    LOG("controller diagnostic: command %s buttons=%#llx duration=%dms",nonce.UTF8String,(unsigned long long)mask,ms);
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)ms*NSEC_PER_MSEC),dispatch_get_main_queue(),^{
++        if (![self->_lastCommand isEqual:nonce]) return;
++        pthread_mutex_lock(&g_mu);g_test_btn=0;pthread_mutex_unlock(&g_mu);publish();
++    });
++}
+ static int32_t axis(float v) { return (int32_t)(fmaxf(-1.f, fminf(1.f, v)) * 32767); }
+-static void read_pad(GCExtendedGamepad *g) {
+-    dm_haptics_apple_controller(0, g.controller);
++static BOOL pad_face_labels(GCExtendedGamepad *g) {
++    const char *face = getenv("DM_PAD_FACE_LABELS");
++    BOOL labels = face && atoi(face);
++    // A third-party pad may report as Xbox or Switch depending on pairing mode.
++    // The exact reported vendor/category can select a user-owned mapping without
++    // changing touch buttons or the mappings of other physical controllers.
++    GCController *controller = g.controller;
++    NSString *key = [NSString stringWithFormat:@"%@|%@", controller.vendorName ?: @"unknown", controller.productCategory ?: @"unknown"];
++    NSString *mode = g_face_maps[key];
++    if ([mode isEqual:@"labels"]) labels = YES;
++    else if ([mode isEqual:@"positions"]) labels = NO;
++    return labels;
++}
++static void read_pad(GCExtendedGamepad *g, BOOL labels) {
+     uint64_t m = 0;
+     #define K(btn, bit) if (btn.isPressed) m |= 1ull << bit
+-    K(g.buttonB, B_A); K(g.buttonA, B_B); K(g.buttonY, B_X); K(g.buttonX, B_Y);   // by position: right A, bottom B, top X, left Y
++    if (labels) { K(g.buttonA, B_A); K(g.buttonB, B_B); K(g.buttonX, B_X); K(g.buttonY, B_Y); }
++    else { K(g.buttonB, B_A); K(g.buttonA, B_B); K(g.buttonY, B_X); K(g.buttonX, B_Y); } // Switch positions
+     K(g.leftShoulder, B_L); K(g.rightShoulder, B_R); K(g.leftTrigger, B_ZL); K(g.rightTrigger, B_ZR);
+     K(g.buttonMenu, B_PLUS); if (g.buttonOptions) K(g.buttonOptions, B_MINUS);
+     if (g.leftThumbstickButton) K(g.leftThumbstickButton, B_LS); if (g.rightThumbstickButton) K(g.rightThumbstickButton, B_RS);
+     K(g.dpad.left, B_LEFT); K(g.dpad.up, B_UP); K(g.dpad.right, B_RIGHT); K(g.dpad.down, B_DOWN);
+     #undef K
+     pthread_mutex_lock(&g_mu);
++    static int logged;
++    if (getenv("DM_PAD_LOG") && m != g_pad_btn && logged++ < 100)
++        LOG("controller buttons: %#llx -> %#llx (%s layout)", (unsigned long long)g_pad_btn, (unsigned long long)m, labels ? "face labels" : "Switch positions");
+     g_pad_btn = m; g_pad_lx = axis(g.leftThumbstick.xAxis.value); g_pad_ly = axis(g.leftThumbstick.yAxis.value);
+     g_pad_rx = axis(g.rightThumbstick.xAxis.value); g_pad_ry = axis(g.rightThumbstick.yAxis.value);
+     pthread_mutex_unlock(&g_mu);
+     publish();
+ }
+ - (void)padsChanged {
++    g_face_maps = [NSUserDefaults.standardUserDefaults dictionaryForKey:@"physicalControllerFaceMaps"];
++    NSString *mapPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/controller-map.json"];
++    NSData *mapData = [NSData dataWithContentsOfFile:mapPath];
++    if (mapData) {
++        id maps = [NSJSONSerialization JSONObjectWithData:mapData options:0 error:nil];
++        BOOL valid = [maps isKindOfClass:NSDictionary.class];
++        if (valid) for (id key in maps) {
++            if (![key isKindOfClass:NSString.class] ||
++                !([maps[key] isEqual:@"labels"] || [maps[key] isEqual:@"positions"])) { valid = NO; break; }
++        }
++        if (valid) { g_face_maps = maps; [NSUserDefaults.standardUserDefaults setObject:maps forKey:@"physicalControllerFaceMaps"]; }
++        else LOG("[RED] controller-map.json rejected: expected vendor|category keys and labels/positions values");
++    }
+     BOOL any = NO;
+     for (GCController *c in GCController.controllers) if (c.extendedGamepad) {
+-        any = YES; c.extendedGamepad.valueChangedHandler = ^(GCExtendedGamepad *g, GCControllerElement *el) { (void)el; read_pad(g); };
+-        read_pad(c.extendedGamepad);
+-    }
+-    if (!any) { dm_haptics_apple_controller(0, nil); pthread_mutex_lock(&g_mu); g_pad_btn = 0; g_pad_lx = g_pad_ly = g_pad_rx = g_pad_ry = 0; pthread_mutex_unlock(&g_mu); publish(); }
+-    dispatch_async(dispatch_get_main_queue(), ^{ self->_padOff = any; self->_controls.hidden = any; [self reset]; });
++        if (getenv("DM_PAD_LOG")) LOG("controller connected: %s, profile %s", c.vendorName.UTF8String ?: "unknown", NSStringFromClass(c.extendedGamepad.class).UTF8String);
++        LOG("controller mapping: %s|%s, %s; reported buttons A=%s B=%s X=%s Y=%s",
++            c.vendorName.UTF8String ?: "unknown", c.productCategory.UTF8String ?: "unknown",
++            pad_face_labels(c.extendedGamepad) ? "labels" : "positions",
++            c.extendedGamepad.buttonA.localizedName.UTF8String ?: "?", c.extendedGamepad.buttonB.localizedName.UTF8String ?: "?",
++            c.extendedGamepad.buttonX.localizedName.UTF8String ?: "?", c.extendedGamepad.buttonY.localizedName.UTF8String ?: "?");
++        // Resolve the persisted controller mode on topology/mapping changes,
++        // not on every stick sample (which otherwise allocates an NSString).
++        BOOL labels = pad_face_labels(c.extendedGamepad);
++        any = YES; c.extendedGamepad.valueChangedHandler = ^(GCExtendedGamepad *g, GCControllerElement *el) { (void)el; read_pad(g, labels); };
++        read_pad(c.extendedGamepad, labels);
++    }
++    if (!any) { pthread_mutex_lock(&g_mu); g_pad_btn = 0; g_pad_lx = g_pad_ly = g_pad_rx = g_pad_ry = 0; pthread_mutex_unlock(&g_mu); publish(); }
++    // A connected controller must not prevent a touch fallback during input
++    // diagnosis. This opt-in keeps the same button mapping and merges both.
++    const char *touch = getenv("DM_PAD_TOUCH");
++    BOOL hide = any && !(touch && atoi(touch));
++    dispatch_async(dispatch_get_main_queue(), ^{ self->_padOff = hide; self->_controls.hidden = hide; [self reset]; });
+ }
+ @end
+ 
+ UIView *dm_gamepad_view(CGRect frame) { DmGamepad *v = [[DmGamepad alloc] initWithFrame:frame]; g_view = v; return v; }
+ void dm_gamepad_reset(void) {   // On resign active: release everything (a key held while switching away and released in background gets no "release")
+     dispatch_async(dispatch_get_main_queue(), ^{ [g_view reset]; });
+-    pthread_mutex_lock(&g_mu); g_pad_btn = 0; g_shake_btn = 0; g_pad_lx = g_pad_ly = g_pad_rx = g_pad_ry = 0; pthread_mutex_unlock(&g_mu); publish();
+-}
++    pthread_mutex_lock(&g_mu); g_pad_btn = 0; g_shake_btn = 0; g_test_btn = 0; g_pad_lx = g_pad_ly = g_pad_rx = g_pad_ry = 0; pthread_mutex_unlock(&g_mu); publish();
++}
+--- a/dm/ios/Sources/Launcher.swift
++++ b/dm/ios/Sources/Launcher.swift
+@@ -1,49 +1,47 @@
+ // Launcher: the settings screen shown before the game starts (front_ios.m dm_show_launcher). Its settings come from the app's dm/launcher.json, which build_ipa.sh writes for this game
+ // from dm/games/settings.tsv (dm/games/settings.py): each sets an environment variable the host reads when the game starts. A variable an env file set (Documents/env.txt, the bundle's
+-// dm/env.txt; main.m lists them in DM_ENV_FILE_KEYS) is shown but kept. The choices are kept in UserDefaults. DM_LAUNCHER=0 in Documents/env.txt starts the game at once, as an app
+-// without launcher.json does
++// dm/env.txt; main.m lists them in DM_ENV_FILE_KEYS) is shown but kept. All settings share one screen, grouped by section. Choices that differ from the game's default are kept
++// in UserDefaults; Reset to tested defaults forgets them. DM_LAUNCHER=0 in Documents/env.txt starts the game at once, as an app without launcher.json does
+ import SwiftUI
+ import UIKit
+ import os
+ 
+-private struct Setting: Decodable, Identifiable {
+-    let env, kind, label, note, def: String
+-    let options: [[String]]?   // choice: [value, label]
+-    let min, max, step: Double?   // range
+-    var id: String { env }
+-    enum CodingKeys: String, CodingKey { case env, kind, label, note, def = "default", options, min, max, step }
++private func info(_ key: String) -> Any? { Bundle.main.object(forInfoDictionaryKey: key) }
++
++private func launcherText(_ value: String) -> String {
++    switch value {
++    case "Frame rate": return "\u{5e27}\u{7387}"
++    case "30 fps": return "30 \u{5e27}/\u{79d2}"
++    case "60 fps": return "60 \u{5e27}/\u{79d2}"
++    case "Render scale": return "\u{6e32}\u{67d3}\u{6bd4}\u{4f8b}"
++    case "Frame buffering": return "\u{5e27}\u{7f13}\u{51b2}"
++    case "May reduce stutter; adds display latency.": return "\u{53ef}\u{51cf}\u{5c11}\u{5361}\u{987f}\u{ff0c}\u{4f46}\u{4f1a}\u{589e}\u{52a0}\u{663e}\u{793a}\u{5ef6}\u{8fdf}\u{3002}"
++    case "Console mode": return "\u{4e3b}\u{673a}\u{6a21}\u{5f0f}"
++    case "Docked": return "\u{5e95}\u{5ea7}\u{6a21}\u{5f0f}"
++    case "Handheld": return "\u{638c}\u{673a}\u{6a21}\u{5f0f}"
++    case "Game language": return "\u{6e38}\u{620f}\u{8bed}\u{8a00}"
++    case "Frame-rate counter": return "\u{663e}\u{793a}\u{5e27}\u{7387}"
++    case "Performance HUD": return "\u{6027}\u{80fd}\u{76d1}\u{89c6}\u{9762}\u{677f}"
++    case "Touch feedback": return "\u{89e6}\u{5c4f}\u{632f}\u{52a8}\u{53cd}\u{9988}"
++    case "Game rumble": return "\u{6e38}\u{620f}\u{632f}\u{52a8}"
++    case "Rumble strength": return "\u{632f}\u{52a8}\u{5f3a}\u{5ea6}"
++    case "Set by an env file": return "\u{7531}\u{914d}\u{7f6e}\u{6587}\u{4ef6}\u{8bbe}\u{5b9a}"
++    case "Memory available": return "\u{5f53}\u{524d}\u{53ef}\u{7528}\u{5185}\u{5b58}"
++    case "Play": return "\u{5f00}\u{59cb}\u{6e38}\u{620f}"
++    case "Game": return "\u{6e38}\u{620f}"
++    case "Reset to tested defaults": return "\u{6062}\u{590d}\u{5df2}\u{6d4b}\u{8bd5}\u{7684}\u{9ed8}\u{8ba4}\u{8bbe}\u{7f6e}"
++    case "Brings back all settings this game was tested with.": return "\u{6062}\u{590d}\u{6b64}\u{6e38}\u{620f}\u{5df2}\u{6d4b}\u{8bd5}\u{7684}\u{5168}\u{90e8}\u{9ed8}\u{8ba4}\u{8bbe}\u{7f6e}\u{3002}"
++    case "Display": return "\u{663e}\u{793a}"
++    case "Controls": return "\u{64cd}\u{4f5c}"
++    case "Performance": return "\u{6027}\u{80fd}"
++    case "Diagnostics": return "\u{8bca}\u{65ad}"
++    default: return value
++    }
+ }
+-private struct SettingsFile: Decodable { let settings: [Setting] }
+ 
+-private func info(_ key: String) -> Any? { Bundle.main.object(forInfoDictionaryKey: key) }
+-private let defaults = UserDefaults.standard
+ 
+-private final class LauncherModel: ObservableObject {
+-    let settings: [Setting]
+-    let fromFile: Set<String>   // set by an env file: shown, not changed
+-    @Published var values: [String: String] = [:]
+-
+-    init(_ settings: [Setting]) {
+-        self.settings = settings
+-        fromFile = Set((ProcessInfo.processInfo.environment["DM_ENV_FILE_KEYS"] ?? "").split(separator: " ").map(String.init))
+-        for s in settings {
+-            if fromFile.contains(s.env), let v = ProcessInfo.processInfo.environment[s.env] { values[s.env] = v; continue }
+-            let saved = defaults.string(forKey: "launcher." + s.env)
+-            values[s.env] = saved.flatMap { v in s.options == nil || s.options!.contains { $0[0] == v } ? v : nil } ?? s.def   // a saved choice the game no longer offers: its default
+-        }
+-    }
+-
++private extension LauncherModel {
+     func binding(_ s: Setting) -> Binding<String> { Binding(get: { self.values[s.env] ?? s.def }, set: { self.values[s.env] = $0 }) }
+-
+-    // Before the game starts: every setting not set by an env file goes into the environment (DM_LANG replaces the packed language main.m set as a default)
+-    func apply() {
+-        for s in settings {
+-            let v = values[s.env] ?? s.def
+-            if fromFile.contains(s.env) { fputs("launcher: \(s.env) kept at \(v) (env file)\n", stderr); continue }
+-            defaults.set(v, forKey: "launcher." + s.env)
+-            setenv(s.env, v, 1); fputs("launcher: \(s.env)=\(v)\n", stderr)
+-        }
+-    }
+ }
+ 
+ private struct SettingRow: View {
+@@ -52,7 +50,7 @@
+ 
+     private var locked: Bool { m.fromFile.contains(s.env) }
+     private var note: String {
+-        locked ? (s.note.isEmpty ? "" : s.note + " · ") + "Set by an env file" : s.note
++        locked ? (s.note.isEmpty ? "" : launcherText(s.note) + " · ") + launcherText("Set by an env file") : launcherText(s.note)
+     }
+     private var rangeValue: Binding<Double> {
+         Binding(get: { Double(m.values[s.env] ?? s.def) ?? s.max ?? 1 },
+@@ -62,7 +60,7 @@
+ 
+     private var settingLabel: some View {
+         VStack(alignment: .leading, spacing: 4) {
+-            Text(s.label)
++            Text(launcherText(s.label))
+             if !note.isEmpty { Text(note).font(.footnote).foregroundStyle(.secondary) }
+         }
+     }
+@@ -72,41 +70,24 @@
+             switch s.kind {
+             case "choice":
+                 Picker(selection: m.binding(s)) {
+-                    ForEach(s.options ?? [], id: \.[0]) { Text($0[1]).tag($0[0]) }
++                    ForEach(s.options ?? [], id: \.[0]) { Text(launcherText($0[1])).tag($0[0]) }
+                 } label: {
+                     settingLabel
+                 }
+-                .pickerStyle(.navigationLink)
++                .pickerStyle(.menu)
+             case "range":
+-                NavigationLink {
+-                    Form {
+-                        Section {
+-                            HStack {
+-                                Text(s.label)
+-                                Spacer()
+-                                Text(percentage).monospacedDigit().foregroundStyle(.secondary)
+-                            }
+-                            Slider(value: rangeValue, in: (s.min ?? 0)...(s.max ?? 1), step: s.step ?? 0.05)
+-                                .accessibilityLabel(s.label)
+-                                .accessibilityValue(percentage)
+-                                .disabled(locked)
+-                        } footer: {
+-                            if !note.isEmpty { Text(note) }
+-                        }
+-                    }
+-                    .contentMargins(.horizontal, 12, for: .scrollContent)
+-                    .navigationTitle(s.label)
+-                    .navigationBarTitleDisplayMode(.inline)
+-                    .toolbar(.visible, for: .navigationBar)
+-                } label: {
++                VStack(alignment: .leading, spacing: 8) {
+                     HStack {
+                         settingLabel
+                         Spacer()
+                         Text(percentage).monospacedDigit().foregroundStyle(.secondary)
+                     }
++                    Slider(value: rangeValue, in: (s.min ?? 0)...(s.max ?? 1), step: s.step ?? 0.05)
++                        .accessibilityLabel(s.label)
++                        .accessibilityValue(percentage)
+                 }
+             default:
+-                Toggle(isOn: Binding(get: { (m.values[s.env] ?? s.def) == "1" }, set: { m.values[s.env] = $0 ? "1" : "0" })) {
++                Toggle(isOn: Binding(get: { (m.values[s.env] ?? s.def) == s.onValue }, set: { m.values[s.env] = $0 ? s.onValue : s.offValue })) {
+                     settingLabel
+                 }
+             }
+@@ -137,24 +118,28 @@
+                 }
+                 .padding(16)
+                 .frame(width: geometry.size.width / 3, height: geometry.size.height)
+-                NavigationStack {
+-                    List {
+-                        Section {
+-                            ForEach(m.settings) { SettingRow(s: $0, m: m) }
+-                        }
+-                        Section {
+-                            HStack {
+-                                Text("Memory available")
+-                                Spacer()
+-                                Text(ByteCountFormatter.string(fromByteCount: Int64(memory), countStyle: .memory)).monospacedDigit().foregroundStyle(.secondary)
+-                            }
++                List {
++                    ForEach(m.sections, id: \.self) { section in
++                        Section(launcherText(section)) {
++                            ForEach(m.settings.filter { $0.sectionTitle == section }) { SettingRow(s: $0, m: m) }
+                         }
+                     }
+-                    .listStyle(.insetGrouped)
+-                    .contentMargins(.horizontal, 12, for: .scrollContent)
+-                    .navigationBarTitleDisplayMode(.inline)
+-                    .toolbar(.hidden, for: .navigationBar)
++                    Section {
++                        Button(launcherText("Reset to tested defaults")) { m.reset() }
++                            .disabled(!m.changed)
++                    } footer: {
++                        Text(launcherText("Brings back all settings this game was tested with."))
++                    }
++                    Section {
++                        HStack {
++                            Text(launcherText("Memory available"))
++                            Spacer()
++                            Text(ByteCountFormatter.string(fromByteCount: Int64(memory), countStyle: .memory)).monospacedDigit().foregroundStyle(.secondary)
++                        }
++                    }
+                 }
++                .listStyle(.insetGrouped)
++                .contentMargins(.horizontal, 12, for: .scrollContent)
+                 .frame(width: geometry.size.width * 2 / 3)
+             }
+         }
+@@ -168,7 +153,7 @@
+     }
+ 
+     @ViewBuilder var playButton: some View {
+-        let button = Button(action: play) { Text("Play").font(.title3.weight(.semibold)).frame(maxWidth: 220) }.controlSize(.large)
++        let button = Button(action: play) { Text(launcherText("Play")).font(.title3.weight(.semibold)).frame(maxWidth: 220) }.controlSize(.large)
+         if #available(iOS 26.0, *) { button.buttonStyle(.glassProminent) } else { button.buttonStyle(.borderedProminent) }
+     }
+ 
+--- /dev/null
++++ b/dm/ios/Sources/LauncherSettings.swift
+@@ -0,0 +1,74 @@
++// Launcher settings, validation and persistence. Shared by the iOS UI and the native storage regression test.
++import Foundation
++import Combine
++
++struct Setting: Decodable, Identifiable {
++    let env, kind, label, note, def: String
++    let section: String?   // heading on the settings screen; absent in older bundles
++    let options: [[String]]?   // choice: [value, label]
++    let min, max, step: Double?   // range
++    let on, off: String?   // toggle: the values the variable takes (1 / 0 when not given)
++    var id: String { env }
++    var sectionTitle: String { section ?? "Game" }
++    var onValue: String { on ?? "1" }
++    var offValue: String { off ?? "0" }
++    func isDefault(_ v: String) -> Bool {   // a range compares as numbers (a slider writes 1.00 for 1.0)
++        kind == "range" ? abs((Double(v) ?? .nan) - (Double(def) ?? .nan)) < 1e-6 : v == def
++    }
++    func accepts(_ v: String) -> Bool {   // a saved choice the game still offers
++        switch kind {
++        case "choice": return options?.contains { $0[0] == v } ?? false
++        case "range":
++            guard let n = Double(v), n.isFinite, let lo = min, let hi = max else { return false }
++            return n >= lo && n <= hi
++        case "toggle": return v == onValue || v == offValue
++        default: return true
++        }
++    }
++    enum CodingKeys: String, CodingKey { case env, kind, label, note, def = "default", section, options, min, max, step, on, off }
++}
++struct SettingsFile: Decodable { let settings: [Setting] }
++
++final class LauncherModel: ObservableObject {
++    let settings: [Setting]
++    let fromFile: Set<String>   // set by an env file: shown, not changed
++    @Published var values: [String: String] = [:]
++
++    private let defaults: UserDefaults
++
++    init(_ settings: [Setting], defaults: UserDefaults = .standard) {
++        self.defaults = defaults
++        self.settings = settings
++        fromFile = Set((ProcessInfo.processInfo.environment["DM_ENV_FILE_KEYS"] ?? "").split(separator: " ").map(String.init))
++        for s in settings {
++            if fromFile.contains(s.env), let v = ProcessInfo.processInfo.environment[s.env] { values[s.env] = v; continue }
++            let saved = defaults.string(forKey: "launcher." + s.env)
++            values[s.env] = saved.flatMap { s.accepts($0) ? $0 : nil } ?? s.def   // a saved choice the game no longer offers: its default
++        }
++    }
++
++    var sections: [String] {
++        settings.reduce(into: []) { if !$0.contains($1.sectionTitle) { $0.append($1.sectionTitle) } }
++    }
++    var changed: Bool { settings.contains { !fromFile.contains($0.env) && !$0.isDefault(values[$0.env] ?? $0.def) } }
++
++    // Reset every launcher choice to the game's defaults; an env file's values stay.
++    func reset() {
++        for s in settings {
++            defaults.removeObject(forKey: "launcher." + s.env)
++            if !fromFile.contains(s.env) { values[s.env] = s.def }
++        }
++        fputs("launcher: settings reset to the game's defaults\n", stderr)
++    }
++
++    // Before the game starts: every setting not set by an env file goes into the environment (DM_LANG replaces the packed language main.m set as a default). Only a choice that
++    // differs from the game's default is stored: a setting the player left at its default follows the defaults of a later build (the settings it was tested with)
++    func apply() {
++        for s in settings {
++            let v = values[s.env] ?? s.def
++            if fromFile.contains(s.env) { fputs("launcher: \(s.env) kept at \(v) (env file)\n", stderr); continue }
++            if s.isDefault(v) { defaults.removeObject(forKey: "launcher." + s.env) } else { defaults.set(v, forKey: "launcher." + s.env) }
++            setenv(s.env, v, 1); fputs("launcher: \(s.env)=\(v)\(s.isDefault(v) ? "" : " (changed)")\n", stderr)
++        }
++    }
++}
+--- a/dm/ios/Sources/front_ios.m
++++ b/dm/ios/Sources/front_ios.m
+@@ -5,6 +5,7 @@
+ #import <Metal/Metal.h>
+ #import <AVFAudio/AVFAudio.h>
+ #include <errno.h>
++#include <stdatomic.h>
+ #include "front.h"
+ #include "hle.h"
+ #include "dm.h"
+@@ -17,6 +18,11 @@
+ bool dm_show_launcher(void *view_controller, void (*done)(void));   // Launcher.swift: false = no launcher (no dm/launcher.json, or DM_LAUNCHER=0)
+ 
+ static CAMetalLayer *g_layer;
++static _Atomic uint64_t g_output_pixels;
++void front_output_pixels(uint32_t *width, uint32_t *height) {
++    uint64_t dimensions = atomic_load(&g_output_pixels);
++    *width = (uint32_t)(dimensions >> 32); *height = (uint32_t)dimensions;
++}
+ static void front_ios_power_watch(void);
+ static void front_ios_audio_watch(void);
+ static UILabel *front_ios_fps_label(void);
+@@ -38,6 +44,8 @@
+     [super layoutSubviews];
+     CAMetalLayer *l = (CAMetalLayer *)self.layer;
+     l.drawableSize = CGSizeMake(self.bounds.size.width * l.contentsScale, self.bounds.size.height * l.contentsScale);
++    uint32_t width = (uint32_t)llround(l.drawableSize.width), height = (uint32_t)llround(l.drawableSize.height);
++    atomic_store(&g_output_pixels, ((uint64_t)width << 32) | height);
+ }
+ @end
+ 
+@@ -86,7 +94,10 @@
+     [super viewDidLayoutSubviews];
+     CGRect b = self.view.bounds; if (!self.game) return;
+     CGFloat w = b.size.width, h = b.size.height;   // Fit 16:9 into the whole screen
++    const char *aspect=getenv("DM_VIEW_ASPECT");
++    if (!(aspect && !strcmp(aspect,"window"))) {
+     if (w / h > 16.0 / 9.0) w = h * 16.0 / 9.0; else h = w * 9.0 / 16.0;
++    }
+     self.game.frame = CGRectMake(floor((b.size.width - w) / 2), floor((b.size.height - h) / 2), w, h);
+     if (self.fps) {   // the top row's free stretch: right of DmGamepad.m's L3 key (102 + 17 of its units from the safe edge), level with − / + (22 units down); u is its unit
+         CGRect s = UIEdgeInsetsInsetRect(b, self.view.safeAreaInsets); CGFloat u = MIN(b.size.height / 430.0, 1.3);
+@@ -226,16 +237,41 @@
+ 
+ // Scene lifecycle (called by SceneDelegate in main.m): 0 resign active, 1 enter background, 2 return to foreground, 3 become active. On entering background, freeze the guest clock and suspend after in-flight GPU work completes (submitting GPU work in background gets the process killed).
+ // The screen stays on while the game is active: only touches reset the idle timer, so with a controller (or during a cutscene) the screen dimmed and locked mid-game
++static UIBackgroundTaskIdentifier g_suspend_task;
++static BOOL g_suspend_task_live;
++static void front_ios_suspend_task_end(void) {
++    if (!g_suspend_task_live) return;
++    UIBackgroundTaskIdentifier task = g_suspend_task;
++    g_suspend_task_live = NO;
++    [UIApplication.sharedApplication endBackgroundTask:task];
++}
+ void front_ios_focus_event(int ev) {
+     if (!g_layer) return;
++    uint64_t started = now_ns();
++    LOG("iOS lifecycle begin event=%d state=%ld background-time=%.2f", ev,
++        (long)UIApplication.sharedApplication.applicationState, UIApplication.sharedApplication.backgroundTimeRemaining);
+     switch (ev) {
+         case 0: dm_gamepad_reset(); dm_focus_set(2); break;
+-        case 1: UIApplication.sharedApplication.idleTimerDisabled = NO; dm_focus_set(3); g_audio_bg = 1; front_ios_audio_apply(); guest_clock_freeze_for(1, 1); dm_gfx_suspend(1); break;
+-        case 2: dm_gfx_suspend(0); guest_clock_freeze_for(1, 0); front_ios_audio_session(); g_audio_bg = 0; front_ios_audio_apply(); dm_focus_set(2); break;
++        case 1:
++            // Cover only the transition's GPU drain, never keep rendering in the background.
++            if (!g_suspend_task_live) {
++                g_suspend_task = [UIApplication.sharedApplication beginBackgroundTaskWithName:@"Suspend graphics" expirationHandler:^{
++                    LOG("[RED] iOS lifecycle: suspension transition background task expired");
++                    front_ios_suspend_task_end();
++                }];
++                g_suspend_task_live = g_suspend_task != UIBackgroundTaskInvalid;
++            }
++            UIApplication.sharedApplication.idleTimerDisabled = NO; dm_focus_set(3); g_audio_bg = 1; front_ios_audio_apply(); guest_clock_freeze_for(1, 1); dm_gfx_suspend(1);
++            front_ios_suspend_task_end();
++            break;
++        case 2:
++            front_ios_suspend_task_end();
++            dm_gfx_suspend(0); guest_clock_freeze_for(1, 0); front_ios_audio_session(); g_audio_bg = 0; front_ios_audio_apply(); dm_focus_set(2); break;
+         case 3:   // Becoming active again also ends an interruption whose "ended" never came (not every one sends it), and retries a session that would not activate on the way back
+             UIApplication.sharedApplication.idleTimerDisabled = YES;
+             if (g_audio_intr) { LOG("audio session: active again with no interruption-ended notice; resuming"); g_audio_intr = 0; g_session_off = 1; }
+             if (g_session_off) front_ios_audio_session();
+             front_ios_audio_apply(); dm_focus_set(1); break;
+     }
+-}
++    LOG("iOS lifecycle end event=%d elapsed=%.3f ms", ev, (now_ns() - started) / 1e6);
++}

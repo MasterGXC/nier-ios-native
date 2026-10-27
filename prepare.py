@@ -12,6 +12,8 @@ def run(*args, cwd=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('destination', type=Path)
+    parser.add_argument('--patch', choices=['current-experimental.patch', 'next-candidate.patch'],
+                        default='current-experimental.patch')
     args = parser.parse_args()
     root = Path(__file__).resolve().parent
     spec = json.loads((root / 'upstream.json').read_text(encoding='utf-8'))
@@ -22,7 +24,7 @@ def main():
     run('git', 'checkout', '--detach', spec['commit'], cwd=target)
     if run('git', 'rev-parse', 'HEAD', cwd=target) != spec['commit']:
         raise RuntimeError('source revision mismatch')
-    patch = str(root / 'current-experimental.patch')
+    patch = str(root / args.patch)
     run('git', 'apply', '--check', patch, cwd=target)
     run('git', 'apply', patch, cwd=target)
     run('git', 'diff', '--check', cwd=target)
