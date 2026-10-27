@@ -1,0 +1,14 @@
+__pycache__/
+*.ipa
+*.nsp
+*.xci
+*.nca
+*.keys
+*.metallib
+*.p12
+*.mobileprovision
+romfs/
+RomFS/
+save/
+env.txt
+log*.txt

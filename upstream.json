@@ -1,0 +1,16 @@
+{
+  "repository": "https://github.com/seedds/nxnative.git",
+  "commit": "31b5944eb47953b5cfdacf1c7d7f7ef7ee0dab22",
+  "reviewed_latest": "cdc6cef6b0250fcb54a061e4c55d56382b5d18ad",
+  "patch_paths": [
+    "dm/gfx/nvn/nvn_geometry.inc",
+    "dm/gfx/nvn/nvn_mtl.m",
+    "dm/gfx/nvn/nvn_rec.h",
+    "dm/gfx/tests/t_geometry.m",
+    "dm/host/crash.c",
+    "dm/ios/Sources/DmGamepad.m",
+    "dm/ios/Sources/Launcher.swift",
+    "dm/ios/Sources/front_ios.m"
+  ],
+  "status": "Experimental; current geometry pool can serialize heavy scenes. Not a stable60fps release."
+}
